@@ -20,9 +20,15 @@
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/LLVMContext.h"
+#include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Type.h"
 #include "llvm/IR/Verifier.h"
+#include "llvm/Support/TargetSelect.h"
+#include "llvm/Target/TargetMachine.h"
+#include "llvm/Transforms/InstCombine/InstCombine.h"
+#include "llvm/Transforms/Scalar.h"
+#include "llvm/Transforms/Scalar/GVN.h"
 
 using namespace llvm;
 
@@ -354,6 +360,7 @@ static std::unique_ptr<FunctionAST> ParseTopLevelExpr() {
 
 static std::unique_ptr<LLVMContext> TheContext;
 static std::unique_ptr<Module> TheModule;
+static std::unique_ptr<llvm::legacy::FunctionPassManager> TheFPM;
 static std::unique_ptr<IRBuilder<>> Builder;
 static std::map<std::string, Value *> NamedValues;
 
@@ -460,6 +467,9 @@ Function *FunctionAST::codegen() {
         // Validate the genereated code.
         verifyFunction(*TheFunction);
 
+        // Optimize this code block.
+        TheFPM->run(*TheFunction);
+
         return TheFunction;
     }
     TheFunction->eraseFromParent();
@@ -475,12 +485,47 @@ static void InitializeModule() {
   Builder = std::make_unique<IRBuilder<>>(*TheContext);
 }
 
+// Initialize a module and pass manager.
+void InitializeModuleAndPassManager(void) {
+    // Create a new LLVM context and module.
+    TheModule = std::make_unique<Module>("my cool jut", *TheContext);
+
+    // Create and attach a pass manager to our module.
+    TheFPM = std::make_unique<legacy::FunctionPassManager>(TheModule.get());
+
+    // Peephole optimizations, Peephole optimizations are performed on a small
+    // set of operations replacing them by faster implementations
+    // for example consider the following code :
+    // b = a + a
+    // This would be replaced by a left shift on A (equivalent to mul by two).
+    TheFPM->add(createInstructionCombiningPass());
+    // Reassociate expressions.
+    TheFPM->add(createReassociatePass());
+    // Eliminate Common SubExpressions, CSE eliminates repetitive expressions
+    // for example consider the following code :
+    // x1 = y * z + b1;
+    // x2 = y * z + b2;
+    // CSE will rewrite it as follows :
+    // t = y * z;
+    // x1 = t + b1;
+    // x2 = t + b2;
+    TheFPM->add(createGVNPass());
+    // CFG simplification will simplify the control flow graph by removing
+    // dead code or eliminating impossible branches (e.g if a constant is
+    // compared to another compile time value).
+    TheFPM->add(createCFGSimplificationPass());
+
+    TheFPM->doInitialization();
+}
+
 static void HandleDefinition() {
   if (auto FnAST = ParseDefinition()) {
     if (auto *FnIR = FnAST->codegen()) {
-      fprintf(stderr, "Read function definition:");
+      fprintf(stderr, "Read function definition:\n");
       FnIR->print(errs());
       fprintf(stderr, "\n");
+      // Initialize the pass manager.
+      InitializeModuleAndPassManager();
     }
   } else {
     // Skip token for error recovery.
@@ -491,7 +536,7 @@ static void HandleDefinition() {
 static void HandleExtern() {
   if (auto ProtoAST = ParseExtern()) {
     if (auto *FnIR = ProtoAST->codegen()) {
-      fprintf(stderr, "Read extern: ");
+      fprintf(stderr, "Read extern: \n");
       FnIR->print(errs());
       fprintf(stderr, "\n");
     }
@@ -505,9 +550,10 @@ static void HandleTopLevelExpression() {
   // Evaluate a top-level expression into an anonymous function.
   if (auto FnAST = ParseTopLevelExpr()) {
     if (auto *FnIR = FnAST->codegen()) {
-      fprintf(stderr, "Read top-level expression:");
+      fprintf(stderr, "Read top-level expression: \n");
       FnIR->print(errs());
       fprintf(stderr, "\n");
+      InitializeModuleAndPassManager();
 
       // Remove the anonymous expression.
       FnIR->eraseFromParent();
@@ -518,7 +564,9 @@ static void HandleTopLevelExpression() {
   }
 }
 
-/// top ::= definition | external | expression | ';'
+
+/// Main loop consumes tokens and calls the respective handler for each
+/// token.
 static void MainLoop() {
   while (true) {
     fprintf(stderr, "ready> ");
@@ -541,21 +589,23 @@ static void MainLoop() {
   }
 }
 
+
 int main(void) {
     // Fill the binary precedence map
      BinopPrecedence['<'] = 10;
      BinopPrecedence['+'] = 20;
      BinopPrecedence['-'] = 20;
      BinopPrecedence['*'] = 40;
-
+    // Start the interpreter.
      fprintf(stderr, "ready> ");
      getNextToken();
-
      // Initialize JIT module
      InitializeModule();
 
+     InitializeModuleAndPassManager();
+    // Run the main looop
      MainLoop();
-
+    // On exit print all collected errors
     TheModule->print(errs(), nullptr);
 
      return 0;
